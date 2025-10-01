@@ -41,6 +41,9 @@ if (process.argv[2]) {
     const code = process.argv[2];
     const idKey = process.argv[3] || "google_default";
 
+    console.log("code:", code);
+    console.log("idKey:", idKey);
+
     (async () => {
         const { tokens } = await oauth2.getToken(code);
         oauth2.setCredentials(tokens);
