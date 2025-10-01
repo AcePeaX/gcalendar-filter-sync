@@ -216,7 +216,7 @@ npm run worker
 
 ## 🔒 Security
 
-* Tokens are encrypted and stored under `secure_tokens/`.
+* Tokens are encrypted and stored under `save/`.
 * File permissions restricted (`chmod 600`).
 * Each user has a separate profile ID.
 
