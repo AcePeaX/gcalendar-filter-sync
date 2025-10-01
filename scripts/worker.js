@@ -31,12 +31,18 @@ function oauthForTokenKey(tokenKey) {
     })();
 }
 
+/** recurring helpers */
+const isRecurringMaster = (ev) =>
+    Array.isArray(ev.recurrence) && !ev.recurringEventId;
+const isInstanceOrSingle = (ev) =>
+    !Array.isArray(ev.recurrence) || !!ev.recurringEventId;
+
 /** Build a matcher over summary/description/location (accent/space-insensitive) */
 function normalize(s) {
     return (s || "")
         .toLowerCase()
         .normalize("NFD")
-        .replace(/\p{Diacritic}/gu, "") // remove accents
+        .replace(/\p{Diacritic}/gu, "")
         .replace(/\s+/g, " ")
         .trim();
 }
@@ -49,13 +55,10 @@ function makeMatcher(filter_type, filters_raw) {
             re.test(ev.description || "") ||
             re.test(ev.location || "");
     }
-
-    // comma-separated filters; handle titles that themselves contain commas fine
     const keys = filters_raw
         .split(",")
         .map((s) => normalize(s))
         .filter(Boolean);
-
     return (ev) => {
         const blob = normalize(
             `${ev.summary || ""} ${ev.description || ""} ${ev.location || ""}`
@@ -68,7 +71,7 @@ async function listChanges(calendar, calId, params) {
     const res = await calendar.events.list({
         calendarId: calId,
         showDeleted: true,
-        singleEvents: false,
+        singleEvents: false, // deltas include masters + exceptions; we will skip masters
         maxResults: 2500,
         ...params,
     });
@@ -88,7 +91,7 @@ async function upsertTarget(calendar, subId, targetCalId, ev) {
         location: ev.location,
         start: ev.start,
         end: ev.end,
-        recurrence: ev.recurrence,
+        // IMPORTANT: we do NOT copy recurrence anymore (instances-only strategy)
         reminders: ev.reminders?.useDefault
             ? { useDefault: true }
             : ev.reminders,
@@ -149,10 +152,10 @@ async function removeTarget(calendar, subId, targetCalId, sourceId) {
     return { removed: 1 };
 }
 
-/** BACKFILL: scan a practical window to create missing matches (new filters etc.) */
+/** BACKFILL: scan window for matches (instances-only) */
 async function backfillWindow(calendar, sub, match) {
-    const daysAhead = Number(process.env.BACKFILL_AHEAD_DAYS || 180); // next ~6 months
-    const daysBehind = Number(process.env.BACKFILL_BEHIND_DAYS || 7); // past week
+    const daysAhead = Number(process.env.BACKFILL_AHEAD_DAYS || 180);
+    const daysBehind = Number(process.env.BACKFILL_BEHIND_DAYS || 7);
     const timeMin = new Date(
         Date.now() - daysBehind * 24 * 3600 * 1000
     ).toISOString();
@@ -167,7 +170,7 @@ async function backfillWindow(calendar, sub, match) {
     do {
         const { data } = await calendar.events.list({
             calendarId: sub.source_calendar_id,
-            singleEvents: true, // expand recurrences to instances
+            singleEvents: true, // expand to instances
             orderBy: "startTime",
             timeMin,
             timeMax,
@@ -176,6 +179,9 @@ async function backfillWindow(calendar, sub, match) {
         });
 
         for (const ev of data.items || []) {
+            // instances-only: expanded instances have recurringEventId for recurring series;
+            // non-recurring events have no recurrence at all — both are allowed.
+            if (!isInstanceOrSingle(ev)) continue;
             if (match(ev)) {
                 const res = await upsertTarget(
                     calendar,
@@ -194,12 +200,10 @@ async function backfillWindow(calendar, sub, match) {
     return { created, updated };
 }
 
-/** PRUNE STALE mapped events (no longer match / cancelled / missing in source) */
+/** PRUNE STALE mapped events (no longer match / cancelled / missing / master) */
 async function pruneStaleMappings(calendar, sub, match) {
     const mapped = db
-        .prepare(
-            `SELECT source_id, target_id FROM event_mappings WHERE subscription_id=?`
-        )
+        .prepare(`SELECT source_id FROM event_mappings WHERE subscription_id=?`)
         .all(sub.id);
 
     let removed = 0;
@@ -210,7 +214,13 @@ async function pruneStaleMappings(calendar, sub, match) {
                 calendarId: sub.source_calendar_id,
                 eventId: row.source_id,
             });
-            if (ev.status === "cancelled" || !match(ev)) {
+
+            // if source is cancelled OR is a recurring master OR no longer matches → remove mirror
+            if (
+                ev.status === "cancelled" ||
+                isRecurringMaster(ev) ||
+                !match(ev)
+            ) {
                 const r = await removeTarget(
                     calendar,
                     sub.id,
@@ -221,7 +231,6 @@ async function pruneStaleMappings(calendar, sub, match) {
             }
         } catch (e) {
             if (e?.code === 404) {
-                // Source is gone → remove our copy + mapping
                 const r = await removeTarget(
                     calendar,
                     sub.id,
@@ -242,7 +251,6 @@ async function pruneStaleMappings(calendar, sub, match) {
  * If DEDUP_MATCH_FILTERS_ONLY=1, only remove unmapped events that also match the filters.
  */
 async function dedupeTarget(calendar, sub, match) {
-    // Build set of "valid" target event IDs from our mappings
     const valid = new Set(
         db
             .prepare(
@@ -264,12 +272,11 @@ async function dedupeTarget(calendar, sub, match) {
             pageToken,
         });
 
-        // Delete any event not in our mappings (i.e., leftovers/duplicates/orphans)
         for (const ev of data.items || []) {
             const id = ev.id;
             const isMapped = valid.has(id);
 
-            // Optionally, only remove if it matches our filters (safer mode)
+            // Remove any leftover non-mapped item. In "safer" mode, only if it matches filters.
             if (!isMapped && (!DEDUP_MATCH_FILTERS_ONLY || match(ev))) {
                 try {
                     await calendar.events.delete({
@@ -321,7 +328,7 @@ async function runSubscription(sub) {
     };
 
     try {
-        // --- Incremental changes (fast path) ---
+        // --- Incremental changes (masters skipped) ---
         do {
             const data = await listChanges(calendar, sub.source_calendar_id, {
                 pageToken,
@@ -339,7 +346,20 @@ async function runSubscription(sub) {
                     removed += r.removed;
                     continue;
                 }
-                if (match(ev)) {
+
+                if (isRecurringMaster(ev)) {
+                    // Ensure we don't have a mirrored master lingering
+                    const r = await removeTarget(
+                        calendar,
+                        sub.id,
+                        sub.target_calendar_id,
+                        ev.id
+                    );
+                    removed += r.removed;
+                    continue;
+                }
+
+                if (isInstanceOrSingle(ev) && match(ev)) {
                     const res = await upsertTarget(
                         calendar,
                         sub.id,
@@ -369,16 +389,16 @@ async function runSubscription(sub) {
             }
         } while (pageToken);
 
-        // --- BACKFILL window to catch events that didn't appear in deltas ---
+        // --- BACKFILL instances in a time window ---
         const bf = await backfillWindow(calendar, sub, match);
         created += bf.created;
         updated += bf.updated;
 
-        // --- PRUNE mapped events that no longer match / were deleted in source ---
+        // --- PRUNE mapped items that are now invalid (incl. masters) ---
         const prune = await pruneStaleMappings(calendar, sub, match);
         removed += prune.removed;
 
-        // --- DEDUPE: remove any leftover events not belonging to this subscription ---
+        // --- DEDUPE anything not mapped to this subscription ---
         const dedup = await dedupeTarget(calendar, sub, match);
         removed += dedup.removed;
     } catch (e) {

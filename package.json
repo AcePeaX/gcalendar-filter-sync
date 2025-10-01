@@ -9,7 +9,9 @@
     "migrate": "node scripts/migrate.js",
     "addsub": "node scripts/add-subscription.js",
     "worker": "node scripts/worker.js",
-    "list": "node scripts/list-subscriptions.js"
+    "list": "node scripts/list-subscriptions.js",
+    "delete": "node scripts/delete-subscription.js",
+    "update": "node scripts/update-subscription-courses.js"
   },
   "type": "module",
   "author": "",
