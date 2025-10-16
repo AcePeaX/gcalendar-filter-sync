@@ -3,6 +3,7 @@ import "dotenv/config";
 import pino from "pino";
 import Database from "better-sqlite3";
 import { google } from "googleapis";
+import crypto from "node:crypto";
 import { createTokenStore } from "./tokenStore.js";
 
 const log = pino({ level: process.env.LOG_LEVEL || "info" });
@@ -37,7 +38,7 @@ const isRecurringMaster = (ev) =>
 const isInstanceOrSingle = (ev) =>
     !Array.isArray(ev.recurrence) || !!ev.recurringEventId;
 
-/** Build a matcher over summary/description/location (accent/space-insensitive) */
+/** accent/space-insensitive normalizer */
 function normalize(s) {
     return (s || "")
         .toLowerCase()
@@ -71,46 +72,97 @@ async function listChanges(calendar, calId, params) {
     const res = await calendar.events.list({
         calendarId: calId,
         showDeleted: true,
-        singleEvents: false, // deltas include masters + exceptions; we will skip masters
+        singleEvents: false, // deltas include masters + exceptions; we will skip masters as targets
         maxResults: 2500,
         ...params,
     });
     return res.data;
 }
 
-async function upsertTarget(calendar, subId, targetCalId, ev) {
+/* -------------------- fingerprinted payload -------------------- */
+
+function stableStringify(obj) {
+    // deterministic stringify (sort keys deep, break cycles)
+    const seen = new WeakSet();
+    const sortDeep = (v) => {
+        if (v && typeof v === "object") {
+            if (seen.has(v)) return null; // should not happen for Google event payloads
+            seen.add(v);
+            if (Array.isArray(v)) return v.map(sortDeep);
+            return Object.fromEntries(
+                Object.keys(v)
+                    .sort()
+                    .map((k) => [k, sortDeep(v[k])])
+            );
+        }
+        return v;
+    };
+    return JSON.stringify(sortDeep(obj));
+}
+
+function fingerprintOfPayload(payload) {
+    return crypto
+        .createHash("sha1")
+        .update(stableStringify(payload))
+        .digest("hex");
+}
+
+/** Build exactly what we mirror to target. Extend if you want to track more fields. */
+function buildPayloadFromSource(ev) {
+    return {
+        summary: ev.summary ?? null,
+        description: ev.description ?? null, // “note”
+        location: ev.location ?? null,
+        start: ev.start, // {date} or {dateTime,timeZone}
+        end: ev.end,
+        reminders: ev.reminders?.useDefault
+            ? { useDefault: true }
+            : ev.reminders ?? undefined,
+        transparency: ev.transparency || "opaque",
+        // If needed, also mirror these and they’ll be fingerprinted:
+        // colorId: ev.colorId ?? undefined,
+        // visibility: ev.visibility ?? undefined,
+        // attendees: ev.attendees ?? undefined,
+        // extendedProperties: ev.extendedProperties ?? undefined,
+    };
+}
+
+/* -------------------- CRUD in target -------------------- */
+
+async function upsertTarget(
+    calendar,
+    subId,
+    targetCalId,
+    ev,
+    forceUpdate = false
+) {
     const existing = db
         .prepare(
             `SELECT * FROM event_mappings WHERE subscription_id=? AND source_id=?`
         )
         .get(subId, ev.id);
 
-    const payload = {
-        summary: ev.summary,
-        description: ev.description,
-        location: ev.location,
-        start: ev.start,
-        end: ev.end,
-        // IMPORTANT: we do NOT copy recurrence anymore (instances-only strategy)
-        reminders: ev.reminders?.useDefault
-            ? { useDefault: true }
-            : ev.reminders,
-        transparency: ev.transparency || "opaque",
-    };
+    const payload = buildPayloadFromSource(ev);
+    const fp = fingerprintOfPayload(payload);
 
     if (existing) {
-        if (existing.etag !== ev.etag) {
+        const contentChanged = existing.fingerprint !== fp;
+        const etagChanged = existing.etag !== ev.etag;
+
+        if (contentChanged || etagChanged || forceUpdate) {
             const updated = await calendar.events.update({
                 calendarId: targetCalId,
                 eventId: existing.target_id,
                 requestBody: payload,
             });
             db.prepare(
-                `INSERT INTO event_mappings(subscription_id,source_id,target_id,etag)
-         VALUES(?,?,?,?)
+                `INSERT INTO event_mappings(subscription_id,source_id,target_id,etag,fingerprint)
+         VALUES(?,?,?,?,?)
          ON CONFLICT(subscription_id,source_id)
-         DO UPDATE SET target_id=excluded.target_id, etag=excluded.etag`
-            ).run(subId, ev.id, updated.data.id, ev.etag);
+         DO UPDATE SET target_id=excluded.target_id,
+                       etag=excluded.etag,
+                       fingerprint=excluded.fingerprint`
+            ).run(subId, ev.id, updated.data.id, ev.etag, fp);
             log.debug({ subId, ev: ev.id }, "updated");
             return { updated: 1, created: 0, removed: 0 };
         }
@@ -121,9 +173,9 @@ async function upsertTarget(calendar, subId, targetCalId, ev) {
             requestBody: payload,
         });
         db.prepare(
-            `INSERT INTO event_mappings(subscription_id,source_id,target_id,etag)
-       VALUES(?,?,?,?)`
-        ).run(subId, ev.id, created.data.id, ev.etag);
+            `INSERT INTO event_mappings(subscription_id,source_id,target_id,etag,fingerprint)
+       VALUES(?,?,?,?,?)`
+        ).run(subId, ev.id, created.data.id, ev.etag, fp);
         log.debug({ subId, ev: ev.id }, "created");
         return { updated: 0, created: 1, removed: 0 };
     }
@@ -152,7 +204,8 @@ async function removeTarget(calendar, subId, targetCalId, sourceId) {
     return { removed: 1 };
 }
 
-/** BACKFILL: scan window for matches (instances-only) */
+/* -------------------- window backfill / prune / dedupe -------------------- */
+
 async function backfillWindow(calendar, sub, match) {
     const daysAhead = Number(process.env.BACKFILL_AHEAD_DAYS || 180);
     const daysBehind = Number(process.env.BACKFILL_BEHIND_DAYS || 7);
@@ -179,8 +232,7 @@ async function backfillWindow(calendar, sub, match) {
         });
 
         for (const ev of data.items || []) {
-            // instances-only: expanded instances have recurringEventId for recurring series;
-            // non-recurring events have no recurrence at all — both are allowed.
+            // instances-only strategy: expanded instances have recurringEventId; singles have no recurrence
             if (!isInstanceOrSingle(ev)) continue;
             if (match(ev)) {
                 const res = await upsertTarget(
@@ -200,7 +252,6 @@ async function backfillWindow(calendar, sub, match) {
     return { created, updated };
 }
 
-/** PRUNE STALE mapped events (no longer match / cancelled / missing / master) */
 async function pruneStaleMappings(calendar, sub, match) {
     const mapped = db
         .prepare(`SELECT source_id FROM event_mappings WHERE subscription_id=?`)
@@ -247,8 +298,8 @@ async function pruneStaleMappings(calendar, sub, match) {
     return { removed };
 }
 
-/** DEDUPE: remove any event in target calendar that isn't mapped to this subscription.
- * If DEDUP_MATCH_FILTERS_ONLY=1, only remove unmapped events that also match the filters.
+/** Remove any event in target calendar that isn't mapped to this subscription.
+ * If DEDUP_MATCH_FILTERS_ONLY=1, only remove unmapped events that also match filters.
  */
 async function dedupeTarget(calendar, sub, match) {
     const valid = new Set(
@@ -276,7 +327,6 @@ async function dedupeTarget(calendar, sub, match) {
             const id = ev.id;
             const isMapped = valid.has(id);
 
-            // Remove any leftover non-mapped item. In "safer" mode, only if it matches filters.
             if (!isMapped && (!DEDUP_MATCH_FILTERS_ONLY || match(ev))) {
                 try {
                     await calendar.events.delete({
@@ -296,6 +346,65 @@ async function dedupeTarget(calendar, sub, match) {
 
     return { removed };
 }
+
+/* -------------------- master-change refresh -------------------- */
+
+async function refreshSeriesForMasterChange(calendar, sub, masterEv, match) {
+    const daysAhead = Number(process.env.BACKFILL_AHEAD_DAYS || 180);
+    const daysBehind = Number(process.env.BACKFILL_BEHIND_DAYS || 7);
+    const timeMin = new Date(
+        Date.now() - daysBehind * 24 * 3600 * 1000
+    ).toISOString();
+    const timeMax = new Date(
+        Date.now() + daysAhead * 24 * 3600 * 1000
+    ).toISOString();
+
+    let pageToken;
+    let created = 0,
+        updated = 0,
+        removed = 0;
+
+    do {
+        const { data } = await calendar.events.instances({
+            calendarId: sub.source_calendar_id,
+            eventId: masterEv.id,
+            timeMin,
+            timeMax,
+            maxResults: 2500,
+            pageToken,
+        });
+
+        for (const inst of data.items || []) {
+            if (!isInstanceOrSingle(inst)) continue;
+
+            if (match(inst)) {
+                const res = await upsertTarget(
+                    calendar,
+                    sub.id,
+                    sub.target_calendar_id,
+                    inst,
+                    /* forceUpdate */ true
+                );
+                created += res.created;
+                updated += res.updated;
+            } else {
+                const r = await removeTarget(
+                    calendar,
+                    sub.id,
+                    sub.target_calendar_id,
+                    inst.id
+                );
+                removed += r.removed;
+            }
+        }
+
+        pageToken = data.nextPageToken || undefined;
+    } while (pageToken);
+
+    return { created, updated, removed };
+}
+
+/* -------------------- subscription runner -------------------- */
 
 async function runSubscription(sub) {
     const oauth2 = await oauthForTokenKey(sub.token_key);
@@ -328,7 +437,7 @@ async function runSubscription(sub) {
     };
 
     try {
-        // --- Incremental changes (masters skipped) ---
+        // --- Incremental changes (masters trigger series refresh) ---
         do {
             const data = await listChanges(calendar, sub.source_calendar_id, {
                 pageToken,
@@ -348,7 +457,18 @@ async function runSubscription(sub) {
                 }
 
                 if (isRecurringMaster(ev)) {
-                    // Ensure we don't have a mirrored master lingering
+                    // Master changed → refresh its instances within our window
+                    const ref = await refreshSeriesForMasterChange(
+                        calendar,
+                        sub,
+                        ev,
+                        match
+                    );
+                    created += ref.created;
+                    updated += ref.updated;
+                    removed += ref.removed;
+
+                    // Also ensure we never keep a mirrored master (legacy safety)
                     const r = await removeTarget(
                         calendar,
                         sub.id,
